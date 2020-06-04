@@ -1,0 +1,2 @@
+files for current susceptibility inversion code. suscept_inversion code to be run initially locally using jupyter, 
+then ported to HPC to be run as slurm batch job for longer training. 
