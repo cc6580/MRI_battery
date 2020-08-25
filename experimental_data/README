@@ -1,0 +1,10 @@
+Here is the code for reading in some experimental data (whole of section named "Read Battery Magnetometry Data").
+You just have to change the path name to where the different experiment files are stored. 
+
+At the end of these sections, newz and newy should then contain the loaded experimental data (the fields in the respective directions). 
+Note that it is scaled by 1e-12 to get Tesla units, but you would still have to rescale them in the same way as your training data.
+
+The rest of the code is older so you can just take the parts that read the experimental data and reshape them into the relevant tensor to make compatible with 
+model predictions.  
+
+
