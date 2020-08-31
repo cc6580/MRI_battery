@@ -1,1 +1,680 @@
-{"nbformat":4,"nbformat_minor":0,"metadata":{"colab":{"name":"test_dist.py","provenance":[],"collapsed_sections":[],"authorship_tag":"ABX9TyOISfMQh3uv4c8xaDVCwJcq"},"kernelspec":{"name":"python3","display_name":"Python 3"}},"cells":[{"cell_type":"code","metadata":{"id":"sFJD4eqG83Jf","colab_type":"code","colab":{}},"source":["# -*- coding: utf-8 -*-\n","\n","# Imports and versions------------------------------------------------------------------------------------------------------------------\n","\n","import numpy as np\n","import matplotlib.pyplot as plt\n","from matplotlib import transforms\n","import matplotlib as mpl\n","# Define Agg as Backend for matplotlib when no X server is running\n","mpl.use('Agg') # AGG backend is for writing to file, not for rendering in a window.\n","from scipy import ndimage\n","from scipy.io import loadmat\n","from scipy import stats \n","import random\n","import time\n","import json\n","import os\n","import nibabel as nib\n","import pickle as pk\n","from scipy import interpolate\n","\n","#either choose keras or tf.keras, and make all imports from that package, and never mix it with the other bc they are not compatible.\n","#make sure you installed tensorflow-gpu as your tensorflow library in your current conda environment\n","import tensorflow as tf\n","from tensorflow import keras\n","from tensorflow.keras import models, layers\n","from tensorflow.keras import backend as K\n","from tensorflow.keras.callbacks import ModelCheckpoint\n","\n","\n","np.random.seed(30)\n","\n","#on HPC, we can check whether we have GPU support here---------------------------------------------------------------------------------------------\n","assert tf.config.list_physical_devices('GPU')\n","assert tf.test.is_built_with_cuda()\n","\n","device_name = tf.test.gpu_device_name()\n","if device_name != '/device:GPU:0':\n","    raise SystemError('GPU device not found')\n","print(30*'-')\n","print('|','Found GPU at: {}'.format(device_name), '|')\n","print(30*'-')\n","\n","# defining 'pseudo' magnetometry mag-field readings grid compatible with real battery data readings-------------------------------------------------\n","rscale=np.array([7.40000000e-05, 1.97920635e-03, 3.88441270e-03, 5.78961905e-03,\n","       7.69482540e-03, 9.60003175e-03, 1.15052381e-02, 1.34104444e-02,\n","       1.53156508e-02, 1.72208571e-02, 1.91260635e-02, 2.10312698e-02,\n","       2.29364762e-02, 2.48416825e-02, 2.67468889e-02, 2.86520952e-02,\n","       3.05573016e-02, 3.24625079e-02, 3.43677143e-02, 3.62729206e-02,\n","       3.81781270e-02, 4.00833333e-02, 4.19885397e-02, 4.38937460e-02,\n","       4.57989524e-02, 4.77041587e-02, 4.96093651e-02, 5.15145714e-02,\n","       5.34197778e-02, 5.53249841e-02, 5.72301905e-02, 5.91353968e-02,\n","       6.10406032e-02, 6.29458095e-02, 6.48510159e-02, 6.67562222e-02,\n","       6.86614286e-02, 7.05666349e-02, 7.24718413e-02, 7.43770476e-02,\n","       7.62822540e-02, 7.81874603e-02, 8.00926667e-02, 8.19978730e-02,\n","       8.39030794e-02, 8.58082857e-02, 8.77134921e-02, 8.96186984e-02,\n","       9.15239048e-02, 9.34291111e-02, 9.53343175e-02, 9.72395238e-02,\n","       9.91447302e-02, 1.01049937e-01, 1.02955143e-01, 1.04860349e-01,\n","       1.06765556e-01, 1.08670762e-01, 1.10575968e-01, 1.12481175e-01,\n","       1.14386381e-01, 1.16291587e-01, 1.18196794e-01, 1.20102000e-01])\n","cscale=np.array([0.001     , 0.00229032, 0.00358065, 0.00487097, 0.00616129,\n","       0.00745161, 0.00874194, 0.01003226, 0.01132258, 0.0126129 ,\n","       0.01390323, 0.01519355, 0.01648387, 0.01777419, 0.01906452,\n","       0.02035484, 0.02164516, 0.02293548, 0.02422581, 0.02551613,\n","       0.02680645, 0.02809677, 0.0293871 , 0.03067742, 0.03196774,\n","       0.03325806, 0.03454839, 0.03583871, 0.03712903, 0.03841935,\n","       0.03970968, 0.041     ])\n","\n","# set up the grid for mag-susceptibility grid--------------------------------------------------------------------------------------------------------\n","battery_dims=np.array([5,30,40])*1e-3;\n","cell_dims=np.array([5,50,60])*1e-3;\n","# probe_dist=1.59e-4; \n","npts=[1,16,32];\n","dV=np.prod(cell_dims/npts); \n","\n","# re-adjust for centering-----------------------------------------------------------------------------------------------------------------------------\n","# for first data\n","centery=0.021;\n","centerz=0.06;\n","\n","# for second data\n","centery=0.015;\n","centerz=0.077;\n","\n","# for damaged cell data\n","centery=0.020;\n","centerz=0.065;\n","\n","# for new send data\n","centery=0.021;\n","centerz=0.062;\n","\n","# covert both the mag-field grid and mag-susceptibility field into row-point representation-----------------------------------------------------------\n","\n","# for mag-suscep\n","srcpos=[[],[],[]]\n","for i in range(3):\n","    srcpos[i]=np.linspace(0,cell_dims[i],npts[i]+2)\n","    srcpos[i]=srcpos[i][1:(npts[i]+1)]\n","\n","# recenter all y and z coordinates\n","srcpos[1]=srcpos[1]+centery-cell_dims[1]/2\n","srcpos[2]=srcpos[2]+centerz-cell_dims[2]/2\n","\n","srcxv,srcyv,srczv=np.meshgrid(srcpos[0],srcpos[1],srcpos[2],indexing='ij')\n","\n","src_fulllength=np.prod(npts)\n","src_pos_list=np.concatenate((srcxv.reshape((src_fulllength,1)),srcyv.reshape((src_fulllength,1)),srczv.reshape((src_fulllength,1))),axis=1)\n","\n","# for mag-field also insert the probe_distance\n","rv, cv = np.meshgrid(rscale, cscale, indexing='ij')\n","fulllength=np.prod(rv.shape)\n","\n","# make a dictionary of all the different field_pos_lists generated with different probe_distances\n","field_dict = dict()\n","dist_list = [5e-3,]\n","for i in range(-8, 2, 1):\n","  probe_dist=1.59*(10**i)\n","  print(probe_dist)\n","  field_pos_list=np.concatenate((cv.reshape((fulllength,1)),\n","                                 rv.reshape((fulllength,1))\n","                                 ),\n","                                axis=1)\n","  field_pos_list=np.insert(field_pos_list,0,probe_dist,axis=1)\n","\n","  field_dict[i] = field_pos_list\n","\n","print(100*'*')\n","\n","# so every different probe_dist generates a different field_pos_list\n","\n","# set up the conversion matrix between mag-suscep and mag-field---------------------------------------------------------------------------------------\n","oneD=0   # to do z-only calc in this framework for magnetic susceptibility (may be more stable)\n","\n","# make a dict of different A tensors generated by different mag-field tensors\n","A_dict = dict()\n","\n","for key in field_dict.keys():\n","  field_pos_list = field_dict[key]\n","\n","  # make sure to reshape such that multiply the correct field components\n","  # A matrix is not very sparse, so maybe faster to do in non-sparse setup\n","  fpl=field_pos_list.shape[0]\n","  A=np.zeros((2,field_pos_list.shape[0],src_pos_list.shape[0],3),dtype=float)\n","  for i in range(src_pos_list.shape[0]):\n","    # for every point in the source position, aka cell grid \n","      posdiff=src_pos_list[i,:]-field_pos_list\n","        # this is a broadcasted operation\n","        # posdiff is field_pos_list but every row is subtracted from ths ith row in suscept_pos_list\n","      inv_r=1/np.sqrt(np.sum(posdiff**2,axis=1))\n","        # performed for each row\n","      inv_r5=inv_r**5\n","      inv_r3=inv_r**3\n","      \n","      for fidx in range(2):\n","          fidx2=fidx+1    # this is the real dim index (compatible with sidx)\n","                          # since I only have y and z components of the field\n","          \n","          if oneD:\n","              sidx=2\n","              A[fidx,:,i,sidx]=3*posdiff[:,fidx2]*posdiff[:,sidx]*inv_r5\n","              # A[0, :, i, 2] = 3*posdiff[:,1]*posdiff[:,2] * inv_r5\n","              # A[1, :, i, 2] = 3*posdiff[:,2]*posdiff[:,2] * inv_r5\n","              if sidx==fidx2:\n","                  A[fidx,:,i,sidx]=A[fidx,:,i,sidx]-inv_r3\n","                  #A[1, :, i, 2] = A[1, :, i, 2] - inv_r3\n","          else:\n","              for sidx in range(3):\n","                  A[fidx,:,i,sidx]=3*posdiff[:,fidx2]*posdiff[:,sidx]*inv_r5\n","                  #A[0, :, i, 0] = 3*posdiff[:, 1] * posdiff[:,0] * inv_r5\n","                  #A[0, :, i, 1] = 3*posdiff[:, 1] * posdiff[:,1] * inv_r5\n","                  #A[0, :, i, 2] = 3*posdiff[:, 1] * posdiff[:,2] * inv_r5\n","                  #A[1, :, i, 0] = 3*posdiff[:, 2] * posdiff[:,0] * inv_r5\n","                  #A[1, :, i, 1] = 3*posdiff[:, 2] * posdiff[:,1] * inv_r5\n","                  #A[1, :, i, 2] = 3*posdiff[:, 2] * posdiff[:,2] * inv_r5\n","                  if sidx==fidx2:\n","                      A[fidx,:,i,sidx]=A[fidx,:,i,sidx]-inv_r3\n","                      #A[0, :, i, 1] = A[0, :, i, 1] - inv_r3\n","                      #A[1, :, i, 2] = A[1, :, i, 2] - inv_r3\n","      \n","  A_dict[key]=A.reshape((fpl*2,src_pos_list.shape[0]*3))\n","# every different probe_dist generates a different field_pos_list which in turn generates a different A tensor\n","\n","# make sure we have generated corresponding tensors\n","assert A_dict.keys() == field_dict.keys()\n","# test to see if the generated tensors are actually different\n","assert np.any(A_dict[0] != A_dict[-2])\n","\n","# proper conversion units\n","for key in A_dict.keys():\n","  B0=20e-6\n","  A_dict[key]=A_dict[key]*dV*B0/4/np.pi\n","\n","# generate psudo battery data sets -------------------------------------------------------------------------------------------------------------------\n","\n","# number of samples to be generated in the set\n","num_sim2=10000\n","\n","# function to forwardly calculate mag-field from synthetic mag-suscept\n","def calcfield(suscept, A):\n","  '''\n","  input:\n","    suscept: a 3-D array of magnetic susceptibility, must have the same shape as npts\n","    A: the 'A' coefficient tensor corresponding to the suscept generated from the different mag-field position grids\n","  return:\n","    fieldy: 2-D matrix of the y-component of magnetic field vector space\n","    fieldz: 2-D matrix of the z-component of magnetic field vector space\n","  '''\n","  source_vec=np.squeeze(suscept[:,:,:]).reshape((src_fulllength*3,1))\n","  magfield=np.dot(A,source_vec)\n","  fieldy = magfield[0:fpl,0].reshape((rv.shape[0],rv.shape[1]))\n","  fieldz = magfield[fpl:2*fpl,0].reshape((rv.shape[0],rv.shape[1]))\n","  return fieldy, fieldz\n","\n","# generate random magntic susceptibility distributions, based on a set of random gaussian peaks \n","\n","# genearte 1 set of data for each different probe_dist\n","# this will be a dictionary of dictionaries\n","set_dict = dict()\n","\n","for key in A_dict.keys():\n","  data_dict = dict()\n","  training_labels=np.zeros((num_sim2, npts[2], npts[1],3)) \n","  training_data=np.zeros((num_sim2, rv.shape[0], rv.shape[1],2))\n","  maxlevelrange=200e-6\n","  numberpeaks=10;\n","  idx1=range(npts[2])\n","  idx2=range(npts[1])\n","  midx1,midx2=np.meshgrid(idx1,idx2,indexing='ij')\n","  for ii in range(num_sim2):\n","    # for now just produce z susceptibility (easier for checking result?)\n","    # here provide alternative training set  exp(-x^2/(2sigma^2))\n","    if True:\n","      for iii in range(numberpeaks):\n","          pos1=np.random.rand(1)*npts[2]\n","          pos2=np.random.rand(1)*npts[1]\n","          w1=np.random.rand(1)*npts[2]/5+1\n","          w2=np.random.rand(1)*npts[1]/5+1\n","          amp=np.random.rand(1)*maxlevelrange\n","          training_labels[ii, :, :,2]=training_labels[ii, :, :,2]+amp*np.exp(-((midx1-pos1)/w1)**2-((midx2-pos2)/w2)**2)\n","    else:\n","      # for network best to create the susceptibility in the transposed version\n","      #training_labels[ii, :, :,2] = maxlevelrange*np.random.rand(npts[1], npts[2])\n","      training_labels[ii, :, :,2] = maxlevelrange*np.random.rand(npts[2], npts[1])  # only z susceptibility for now \n","        \n","    training_data[ii, :, :,0],training_data[ii, :, :,1] = calcfield(training_labels[ii,:,:,:], A_dict[key])\n","    # so the input data will be the mag-field, chanel 0 will be y-component, chanel 1 will be z-component\n","    # the output, or what we are trying to predict, are the mag susceptibilities\n","\n","  # train, validation, and test split-------------------------------------------------------------------------------------------------------------\n","\n","  # a list of random indices thats 40% of the samples\n","  val_test_idx = random.sample(range(num_sim2), int(0.4*num_sim2))\n","  # get the remainder of the indices as train\n","  train_idx = np.setdiff1d(range(num_sim2),val_test_idx)\n","\n","  val_data = training_data[val_test_idx[:int(0.4*num_sim2/2)], :, :, :]\n","  val_labels = training_labels[val_test_idx[:int(0.4*num_sim2/2)], :, :, :]\n","\n","  test_data = training_data[val_test_idx[int(0.4*num_sim2/2):], :, :, :]\n","  test_labels = training_labels[val_test_idx[int(0.4*num_sim2/2):], :, :, :]\n","\n","  train_data = training_data[train_idx, :, :, :]\n","  train_labels = training_labels[train_idx, :, :, :]\n","\n","  # TF requires this kind of transformation into tensor\n","  train_images_t2b=tf.constant(train_data)\n","  train_labels_t2b=tf.constant(train_labels)\n","\n","  val_images_t2b=tf.constant(val_data)\n","  val_labels_t2b=tf.constant(val_labels)\n","\n","  test_images_t2b=tf.constant(test_data)\n","  test_labels_t2b=tf.constant(test_labels)\n","\n","  data_dict['train_images_t2b'] = train_images_t2b\n","  data_dict['train_labels_t2b'] = train_labels_t2b\n","  data_dict['val_images_t2b'] = val_images_t2b\n","  data_dict['val_labels_t2b'] = val_labels_t2b\n","  data_dict['test_images_t2b'] = test_images_t2b\n","  data_dict['test_labels_t2b'] = test_labels_t2b\n","\n","  # put this dictionary of datasets into the dictionary of different probe_dist\n","  set_dict[key] = data_dict\n","\n","# make sure we have actually generated different data based on differet probe_dist\n","assert np.any(set_dict[-2]['train_images_t2b'] != set_dict[0]['train_images_t2b'])\n","\n","def imshow_center(data):\n","  '''\n","  Display data as an image; i.e. on a 2D regular raster.\n","  input:\n","    data: a single battery's \n","      magnetic field image that is an array with shape [64,32] with scalar data,\n","      or magnetic susceptibility image that is an array with shape [32,16]\n","  output:\n","    figure\n","  '''\n","  maxval=np.max(np.abs(data))\n","  plt.imshow(data, cmap=\"seismic\",vmin=-maxval,vmax=maxval)\n","  plt.colorbar()\n","\n","imshow_center(set_dict[-4]['train_images_t2b'][33,:,:,0])\n","plt.savefig('-4_training_sample_33.png')\n","\n","# for historical reasons, the magnetic susceptibility map shows up transpose, \n","# I guess it would be good to change that at some point, but for now keeping it \n","imshow_center(np.transpose(set_dict[-4]['train_labels_t2b'][33,:,:,2]))\n","plt.savefig('-4_training_label_33.png')\n","\n","imshow_center(set_dict[-2]['train_images_t2b'][33,:,:,0])\n","plt.savefig('-2_training_sample_33.png')\n","\n","# for historical reasons, the magnetic susceptibility map shows up transpose, \n","# I guess it would be good to change that at some point, but for now keeping it \n","imshow_center(np.transpose(set_dict[-2]['train_labels_t2b'][33,:,:,2]))\n","plt.savefig('-2_training_label_33.png')\n","\n","imshow_center(set_dict[0]['train_images_t2b'][33,:,:,0])\n","plt.savefig('0_training_sample_33.png')\n","\n","# for historical reasons, the magnetic susceptibility map shows up transpose, \n","# I guess it would be good to change that at some point, but for now keeping it \n","imshow_center(np.transpose(set_dict[0]['train_labels_t2b'][33,:,:,2]))\n","plt.savefig('0_training_label_33.png')\n","\n","# model setup ----------------------------------------------------------------------------------------------------------------------------------------\n","\n","def get_figure():\n","    \"\"\"\n","    Returns:\n","      an emtpy figure and an empty axis objects to plot on. \n","    \n","    Removes top and right border and ticks, because those are ugly\n","    \"\"\"\n","    fig, ax = plt.subplots(1)\n","    plt.tick_params(top=False, right=False, which='both') \n","    ax.spines['top'].set_visible(False)\n","    ax.spines['right'].set_visible(False)\n","    return fig, ax\n","\n","def conv_block_h2(input_tensor, num_filters, dropout_level = 0.15):\n","    encoder = layers.Conv2D(num_filters, (3, 3), padding='same')(input_tensor)\n","    encoder = layers.BatchNormalization()(encoder)\n","    encoder = layers.Activation('relu')(encoder)\n","    encoder = layers.Conv2D(num_filters, (3, 3), padding='same')(encoder)\n","    encoder = layers.BatchNormalization()(encoder)\n","    encoder = layers.Dropout(dropout_level)(encoder)\n","    encoder = layers.Activation('relu')(encoder)\n","    return encoder\n","\n","def encoder_block_h2(input_tensor, num_filters, dropout_level = 0.15):\n","    encoder = layers.BatchNormalization()(input_tensor) # added a first normalization layer\n","    encoder = conv_block_h2(input_tensor, num_filters)\n","    encoder_pool = layers.MaxPooling2D((2, 2), strides=(2, 2))(encoder)\n","    return encoder_pool, encoder\n","\n","def decoder_block_h2(input_tensor, concat_tensor, num_filters, dropout_level = 0.15):\n","    decoder = layers.Conv2DTranspose(num_filters, (2, 2), strides=(2, 2), padding='same')(input_tensor)\n","    decoder = layers.concatenate([concat_tensor, decoder], axis=-1)\n","    decoder = layers.Conv2D(num_filters, (3, 3), padding='same')(decoder)\n","    decoder = layers.BatchNormalization()(decoder)\n","    decoder = layers.Dropout(dropout_level)(decoder)\n","    decoder = layers.Activation('relu')(decoder)\n","    decoder = layers.Conv2D(num_filters, (3, 3), padding='same')(decoder)\n","    decoder = layers.BatchNormalization()(decoder)\n","    decoder = layers.Activation('relu')(decoder)\n","    return decoder\n","\n","def custom_loss_mse(y_true,y_pred):\n","    loss=K.mean(K.square(y_pred-y_true),axis=None)  #+K.sum(0*K.abs(penalty)) #can adjust the penalty weight\n","    return loss\n","\n","def custom_loss_rmse(y_true,y_pred):\n","    loss=K.sqrt(K.mean(K.square(y_pred-y_true),axis=None))  #+K.sum(0*K.abs(penalty)) #can adjust the penalty weight\n","    return loss\n","\n","def custom_loss_abs(y_true,y_pred):\n","    loss=K.mean(K.abs(y_pred-y_true),axis=None)  #+K.sum(0*K.abs(penalty)) #can adjust the penalty weight\n","    return loss\n","\n","# grid search over model ------------------------------------------------------------------------------------------------------------------------------\n","\n","# our model might not be able to be wrapped in a scikit_learn model\n","# so we have to do the for-loops by hand\n","# train and val sets are not part of the input, so they must be defined as global variables prior\n","# unless, in this case, we need to fit on different train and val sets\n","# so they must be configured as function arguments for us to insert different sets into the model fitting\n","\n","# set the default values to the best parameter values we have found so far\n","\n","def grid_search(train_images_t2b, train_labels_t2b, val_images_t2b, val_labels_t2b, dist,\n","                dropout_level_lst=[0.05], beta2_lst=[0.999], beta1_lst=[0.9], lr_rate_lst = [0.001],\n","                epsilon_lst=[1e-08], epo_lst = [3000], bat_size_lst = [128]\n","                ):\n","  # initialize values\n","  val_loss = np.inf\n","  best_params = dict()\n","  dist=dist\n","\n","  for dp_level in dropout_level_lst:\n","    inputs_h2 = layers.Input(shape=(64,32,2))\n","    # same as (rscale, cscale, 2)\n","    # also same as the dimension for EACH image in the training set\n","    encoder0_pool_h2, encoder0_h2 = encoder_block_h2(inputs_h2, 8, dropout_level=dp_level)\n","    encoder1_pool_h2, encoder1_h2 = encoder_block_h2(encoder0_pool_h2, 16, dropout_level=dp_level)\n","    encoder2_pool_h2, encoder2_h2 = encoder_block_h2(encoder1_pool_h2, 32, dropout_level=dp_level)\n","    encoder3_pool_h2, encoder3_h2 = encoder_block_h2(encoder2_pool_h2, 64, dropout_level=dp_level)\n","    center_h2 = conv_block_h2(encoder3_pool_h2, 128, dropout_level=dp_level)\n","    decoder3_h2 = decoder_block_h2(center_h2, encoder3_h2, 64, dropout_level=dp_level)\n","    decoder2_h2 = decoder_block_h2(decoder3_h2, encoder2_h2, 32, dropout_level=dp_level)\n","    decoder1_h2 = decoder_block_h2(decoder2_h2, encoder1_h2, 16, dropout_level=dp_level)\n","    outputs_h2 = layers.Conv2D(3, (1, 1), padding=\"same\")(decoder1_h2)   # simply set number of output channels here, seems legit\n","\n","    model_ht2b = models.Model(inputs=[inputs_h2], outputs=[outputs_h2])\n","\n","    for beta2 in beta2_lst:\n","      for beta1 in beta1_lst:\n","        for lr_rate in lr_rate_lst:\n","          for eps in epsilon_lst:\n","            adam=keras.optimizers.Adam(learning_rate = lr_rate, beta_1 = beta1, beta_2=beta2, epsilon = eps)\n","\n","            model_ht2b.compile(optimizer=adam,\n","                               loss=custom_loss_rmse) # let's use rmse for optimization becuase it is a bigger target than mse\n","\n","            # construct checkpoint for saving the best model for current training\n","            curr_best_filepath=str(dist)+\"/current.best.h5\"\n","            checkpoint = ModelCheckpoint(curr_best_filepath, \n","                                        monitor='val_loss', # this must be the same string as a metric from your model training verbose output\n","                                        verbose=1, \n","                                        save_best_only=True, # only save the model if it out-performs all previous ones\n","                                        mode='min', # we want minimum loss\n","                                        save_weights_only=False # we want to save the entire model, not just the weights\n","                                        )\n","            callbacks_list = [checkpoint]\n","\n","            for epo in epo_lst:\n","              for bat_size in bat_size_lst:\n","                start = time.time()\n","                history_ht2b = model_ht2b.fit(train_images_t2b, \n","                                              train_labels_t2b,\n","                                              validation_data = (val_images_t2b, val_labels_t2b),  \n","                                              epochs=epo, \n","                                              batch_size=bat_size, \n","                                              shuffle=True,\n","                                              callbacks = callbacks_list,\n","                                              verbose=1)\n","                training_time = time.time()-start\n","                \n","                # load best model from current training b/c the best model might not be the last model\n","                model_ht2b = tf.keras.models.load_model(curr_best_filepath, \n","                                                        custom_objects={'custom_loss_rmse': custom_loss_rmse})\n","                new_loss = custom_loss_rmse(val_labels_t2b, model_ht2b.predict(val_images_t2b))\n","                \n","                if new_loss.numpy() < val_loss:\n","                  print()\n","                  print('final validation loss decreased from ', val_loss, ' to ', new_loss.numpy())\n","                  print('saving the current best model as the overall best model')\n","                  print(100*'*')\n","                  val_loss = new_loss.numpy()\n","                  \n","                  best_params['best_dropout_rate'] = dp_level\n","                  best_params['best_beta_2'] = beta2\n","                  best_params['best_beta_1'] = beta1\n","                  best_params['best_learning_rate'] = lr_rate\n","                  best_params['best_epsilon'] = eps\n","                  best_params['best_epochs'] = epo\n","                  best_params['best_batch_size'] = bat_size\n","\n","                  best_params['best_val_loss_reached'] = val_loss\n","                  best_params['training_time'] = training_time\n","                  best_params['val_loss_his'] = history_ht2b.history['val_loss']\n","                  best_params['train_loss_his'] = history_ht2b.history['loss']\n","                    # comment these out for now because they take way too much space when printed out \n","                  \n","                  # save the best overall grid-searched model found so far \n","                  best_filepath = str(dist)+'/model.best.h5'\n","                  model_ht2b.save(best_filepath)\n","                  \n","                  # save history of validation-loss from the best model to observe epochs effect\n","                  with open(str(dist)+'/best_val_loss_history.db', 'wb') as file_pi:\n","                    pk.dump(history_ht2b.history['val_loss'], file_pi)\n","                  # later open with \n","                  # val_loss_history_ht2b = pk.load(open('best_val_loss_history.db', \"rb\"))\n","\n","                  # save history of training-loss from the best model to observe epochs effect\n","                  with open(str(dist)+'/best_train_loss_history.db', 'wb') as file_pi:\n","                    pk.dump(history_ht2b.history['loss'], file_pi)\n","                  # later open with \n","                  # train_loss_history_ht2b = pk.load(open('best_train_loss_history.db', \"rb\"))\n","\n","                  # save the best_params dictionary along the way incase training gets killed mid-way and the function doesn't get to finish\n","                  # \"w\" mode automatically overwrites if the file already exists\n","                  param_json = json.dumps(best_params)\n","                  f = open(str(dist)+'/best_params.json',\"w\")\n","                  f.write(param_json)\n","                  f.close()\n","\n","                  # save a plot of the val_loss_history for the best performing model for observation\n","                  fig, ax = get_figure()\n","                  fig.set_size_inches(20,10)\n","                  num_epochs=len(history_ht2b.history['val_loss'])\n","                  startpoints=0\n","                  ax.set_yscale('log') # set y-axis to log_10 scale for better viewing\n","                  ax.plot((np.arange(num_epochs*1)+1)[startpoints:], \n","                          history_ht2b.history['loss'][startpoints:], \n","                          linewidth=1, color=\"orange\", \n","                          label=\"training_loss\")\n","                  ax.plot((np.arange(num_epochs*1)+1)[startpoints:], \n","                          history_ht2b.history['val_loss'][startpoints:], \n","                          linewidth=1, color=\"blue\", \n","                          label=\"validation loss\")\n","                  ax.set_xlabel('epochs')\n","                  ax.set_ylabel('log loss')\n","                  ax.legend(frameon=False);\n","                  fig.savefig(str(dist)+'/best_model_loss_history.png')\n","                else:\n","                  print('final validation loss did not decrease for this set of parameters')\n","                  print('current overall best model and parameters does not get updated')\n","                  print(100*'*')\n","  return best_params\n","\n","result_dict = dict()\n","\n","for key in set_dict.keys():\n","  dist=key\n","  specs_dict = dict()\n","  \n","  try:\n","    os.mkdir(str(key)) # make a directory before we can put things under it\n","  except:\n","    print(\"directory already exists\")\n","\n","  best_params = grid_search(set_dict[key]['train_images_t2b'], set_dict[key]['train_labels_t2b'],\n","                            set_dict[key]['val_images_t2b'], set_dict[key]['val_labels_t2b'], dist=key)\n","  specs_dict['best_val_loss_reached'] = best_params['best_val_loss_reached']\n","  specs_dict['training_time'] = best_params['training_time']\n","  specs_dict['val_loss_his'] = best_params['val_loss_his']\n","  specs_dict['train_loss_his'] = best_params['train_loss_his']\n","\n","  # predict w the best model, or in this case, only 1 model, on the test set\n","  model_ht2b=tf.keras.models.load_model(str(dist)+'/model.best.h5',\n","                                        custom_objects={'custom_loss_rmse': custom_loss_rmse})\n","  susax=2\n","  test_images_t2b = set_dict[key]['test_images_t2b']\n","  test_labels_t2b = set_dict[key]['test_labels_t2b']\n","  X_test = test_images_t2b\n","  y_pred_ht2 = model_ht2b.predict(test_images_t2b)\n","\n","  plt.figure()\n","  imshow_center(y_pred_ht2[20,:,:,susax])\n","  plt.title(\"predicted susceptibility for the 20th battery in test set with distance 1.59e\"+str(key))\n","  plt.savefig(str(dist)+\"/test_20_pred.png\")\n","\n","  plt.figure()\n","  imshow_center(test_labels_t2b[20,:,:,susax])\n","  plt.title(\"actual susceptibility for the 20th battery in test set with distance 1.59e\"+str(key))\n","  plt.savefig(str(dist)+\"/test_20_true.png\")\n","\n","  plt.figure()\n","  imshow_center(y_pred_ht2[20,:,:,susax]-test_labels_t2b[20,:,:,susax])\n","  # plot the the predicted susceptibility - actual susceptibility in the same chanel which is '2' for the 20th battery in test set\n","  # we want this difference to be as small as possible, not too extreme in either way\n","  plt.title(\"difference between predicted and true susceptibility for the 20th battery in test set with distance 1.59e\"+str(key))\n","  plt.savefig(str(dist)+'/test_20_difference.png')\n","\n","  test_diff = test_labels_t2b - y_pred_ht2\n","  test_diff = tf.keras.backend.flatten(test_diff)\n","  plt.figure(figsize=(15,7))\n","  plt.hist(test_diff, bins=30, density=True, label='difference');\n","  mn, mx = plt.xlim()\n","  plt.xlim(mn, mx)\n","  kde_xs = np.linspace(mn, mx, 60)\n","  kde = stats.gaussian_kde(test_diff)\n","  plt.plot(kde_xs, kde.pdf(kde_xs), label=\"PDF\")\n","  plt.legend(loc=\"upper left\")\n","  plt.ylabel('Probability')\n","  plt.xlabel('difference')\n","  range = np.max([np.abs(np.min(test_diff)), np.abs(np.max(test_diff))])\n","  plt.xlim(-range, range)\n","  plt.title(\"Histogram of differences for the test set with distance 1.59e\"+str(key));\n","  plt.savefig(str(dist)+\"/test_diff_hist.png\")\n","\n","  yf,zf=calcfield(y_pred_ht2[20,:,:,:], A_dict[key])\n","  # calculate the y(dimension 0) and z(dimension 1) component of the magnetic field for the 20th battery\n","  # from the predicted susceptibility output\n","  # so we are kind of like recreating the input to see if it is the same as the actual input\n","  # to see if the model learned the dipole forward kernel well\n","\n","  plt.figure()\n","  imshow_center(np.squeeze(X_test[0,:,:,0])-yf)\n","  plt.title(\"error between forwardly solved y-field from prediction and true input y-field for the 20th battery in test set with distance 1.59e\"+str(key))\n","  plt.savefig(str(dist)+\"/test_20_yfield_diff.png\")\n","\n","  plt.figure()\n","  imshow_center(np.squeeze(X_test[0,:,:,1])-zf)\n","  plt.title(\"error between forwardly solved z-field from prediction and true input y-field for the 20th battery in test set with distance 1.59e\"+str(key))\n","  plt.savefig(str(dist)+\"/test_20_zfield_diff.png\")\n","\n","  final_loss = custom_loss_rmse(test_labels_t2b, y_pred_ht2)\n","  print('final RMSE loss on test set:', final_loss.numpy())\n","  NRMSE = final_loss/K.mean(test_labels_t2b)\n","  print('final normalized RMSE loss (div mean) on the test set:', NRMSE.numpy())\n","  RMSE_range = final_loss /(tf.reduce_max(test_labels_t2b) - tf.reduce_min(test_labels_t2b))\n","  print('final normalized RMSE loss (div range) on the test set:', RMSE_range.numpy())\n","  test_arr = tf.keras.backend.flatten(test_labels_t2b).numpy()\n","  IQR = stats.iqr(test_arr)\n","  RMSE_IQR = final_loss/IQR\n","  print('final normalized RMSE loss (div IQR) on the test set:', RMSE_IQR.numpy())\n","  print('final norm of the difference tensor:', tf.norm(y_pred_ht2-test_labels_t2b).numpy())\n","  Boll_NRMSE = tf.norm(y_pred_ht2-test_labels_t2b) / tf.norm(test_labels_t2b)\n","  print('final Bollman normalized RMSE loss on the test set:', Boll_NRMSE.numpy())  \n","\n","  specs_dict['final_RMSE'] = final_loss.numpy()\n","  specs_dict['NRMSE'] = NRMSE.numpy()\n","  specs_dict['RMSE_range'] = RMSE_range.numpy()\n","  specs_dict['RMSE_IQR'] = RMSE_IQR.numpy()\n","  specs_dict['Boll_NRMSE'] = Boll_NRMSE.numpy()\n","\n","  result_dict[key] = specs_dict\n","\n","  print(100*'|')\n","\n","assert result_dict.keys() == set_dict.keys()\n","assert len(result_dict[-8].keys()) == 9 # there should be 9 different specs for each distance \n","\n","Boll_NRMSE_lst = []\n","best_val_loss_lst=[]\n","dict_lst = []\n","for key in result_dict.keys():\n","  Boll_NRMSE_lst.append(result_dict[key]['Boll_NRMSE'])\n","  best_val_loss_lst.append(result_dict[key]['best_val_loss_reached'])\n","  dict_lst.append(key)\n","  # let's add the key here to really make sure the losses and the distances match up\n","\n","print(dict_lst)\n","print(Boll_NRMSE_lst)\n","print(100*'*')\n","plt.figure(figsize=None)\n","plt.plot(dict_lst, Boll_NRMSE_lst, label=\"test_Boll_NRMSE\", linestyle='--', marker='o') \n","plt.legend()\n","plt.xlabel('1.59e')\n","plt.savefig('dist_vs_NRMSE.png')\n","\n","print(dict_lst)\n","print(best_val_loss_lst)\n","print(100*'*')\n","plt.figure(figsize=None)\n","plt.plot(dict_lst, best_val_loss_lst, label=\"best_val_loss\", linestyle='--', marker='o') \n","plt.legend()\n","plt.xlabel('1.59e')\n","plt.ylabel('rmse')\n","plt.savefig('dist_vs_val_loss.png')\n","\n","try:\n","  # save the final result dictionary\n","  # bc earlier versions of python does not support 'with' statement we have to do this?\n","  result_json = json.dumps(result_dict)\n","  f = open(\"result_dict.json\",\"w\")\n","  f.write(result_json)\n","  f.close()\n","  print('saved result dictionary')\n","\n","  # load the json file later with\n","  # f = open(\"result_dict.json\", \"r\")\n","  # try:\n","  #     result_dict = json.load(f)\n","  # finally:\n","  #     f.close()\n","except:\n","  print('could not save result dictionary')\n","  "],"execution_count":null,"outputs":[]}]}
+# -*- coding: utf-8 -*-
+"""test_dist.py
+
+Automatically generated by Colaboratory.
+
+Original file is located at
+    https://colab.research.google.com/drive/1gfuAJzbGepoZjzspmuBkXo3Ia8mfLYhU
+"""
+
+# -*- coding: utf-8 -*-
+
+# Imports and versions------------------------------------------------------------------------------------------------------------------
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import transforms
+import matplotlib as mpl
+# Define Agg as Backend for matplotlib when no X server is running
+mpl.use('Agg') # AGG backend is for writing to file, not for rendering in a window.
+from scipy import ndimage
+from scipy.io import loadmat
+from scipy import stats 
+import random
+import time
+import json
+import os
+import nibabel as nib
+import pickle as pk
+from scipy import interpolate
+
+#either choose keras or tf.keras, and make all imports from that package, and never mix it with the other bc they are not compatible.
+#make sure you installed tensorflow-gpu as your tensorflow library in your current conda environment
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import models, layers
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+
+np.random.seed(30)
+
+#on HPC, we can check whether we have GPU support here---------------------------------------------------------------------------------------------
+assert tf.config.list_physical_devices('GPU')
+assert tf.test.is_built_with_cuda()
+
+device_name = tf.test.gpu_device_name()
+if device_name != '/device:GPU:0':
+    raise SystemError('GPU device not found')
+print(30*'-')
+print('|','Found GPU at: {}'.format(device_name), '|')
+print(30*'-')
+
+# defining 'pseudo' magnetometry mag-field readings grid compatible with real battery data readings-------------------------------------------------
+rscale=np.array([7.40000000e-05, 1.97920635e-03, 3.88441270e-03, 5.78961905e-03,
+       7.69482540e-03, 9.60003175e-03, 1.15052381e-02, 1.34104444e-02,
+       1.53156508e-02, 1.72208571e-02, 1.91260635e-02, 2.10312698e-02,
+       2.29364762e-02, 2.48416825e-02, 2.67468889e-02, 2.86520952e-02,
+       3.05573016e-02, 3.24625079e-02, 3.43677143e-02, 3.62729206e-02,
+       3.81781270e-02, 4.00833333e-02, 4.19885397e-02, 4.38937460e-02,
+       4.57989524e-02, 4.77041587e-02, 4.96093651e-02, 5.15145714e-02,
+       5.34197778e-02, 5.53249841e-02, 5.72301905e-02, 5.91353968e-02,
+       6.10406032e-02, 6.29458095e-02, 6.48510159e-02, 6.67562222e-02,
+       6.86614286e-02, 7.05666349e-02, 7.24718413e-02, 7.43770476e-02,
+       7.62822540e-02, 7.81874603e-02, 8.00926667e-02, 8.19978730e-02,
+       8.39030794e-02, 8.58082857e-02, 8.77134921e-02, 8.96186984e-02,
+       9.15239048e-02, 9.34291111e-02, 9.53343175e-02, 9.72395238e-02,
+       9.91447302e-02, 1.01049937e-01, 1.02955143e-01, 1.04860349e-01,
+       1.06765556e-01, 1.08670762e-01, 1.10575968e-01, 1.12481175e-01,
+       1.14386381e-01, 1.16291587e-01, 1.18196794e-01, 1.20102000e-01])
+cscale=np.array([0.001     , 0.00229032, 0.00358065, 0.00487097, 0.00616129,
+       0.00745161, 0.00874194, 0.01003226, 0.01132258, 0.0126129 ,
+       0.01390323, 0.01519355, 0.01648387, 0.01777419, 0.01906452,
+       0.02035484, 0.02164516, 0.02293548, 0.02422581, 0.02551613,
+       0.02680645, 0.02809677, 0.0293871 , 0.03067742, 0.03196774,
+       0.03325806, 0.03454839, 0.03583871, 0.03712903, 0.03841935,
+       0.03970968, 0.041     ])
+
+# set up the grid for mag-susceptibility grid--------------------------------------------------------------------------------------------------------
+battery_dims=np.array([5,30,40])*1e-3;
+cell_dims=np.array([5,50,60])*1e-3;
+# probe_dist=1.59e-4; 
+npts=[1,16,32];
+dV=np.prod(cell_dims/npts); 
+
+# re-adjust for centering-----------------------------------------------------------------------------------------------------------------------------
+# for first data
+centery=0.021;
+centerz=0.06;
+
+# for second data
+centery=0.015;
+centerz=0.077;
+
+# for damaged cell data
+centery=0.020;
+centerz=0.065;
+
+# for new send data
+centery=0.021;
+centerz=0.062;
+
+# covert both the mag-field grid and mag-susceptibility field into row-point representation-----------------------------------------------------------
+
+# for mag-suscep
+srcpos=[[],[],[]]
+for i in range(3):
+    srcpos[i]=np.linspace(0,cell_dims[i],npts[i]+2)
+    srcpos[i]=srcpos[i][1:(npts[i]+1)]
+
+# recenter all y and z coordinates
+srcpos[1]=srcpos[1]+centery-cell_dims[1]/2
+srcpos[2]=srcpos[2]+centerz-cell_dims[2]/2
+
+srcxv,srcyv,srczv=np.meshgrid(srcpos[0],srcpos[1],srcpos[2],indexing='ij')
+
+src_fulllength=np.prod(npts)
+src_pos_list=np.concatenate((srcxv.reshape((src_fulllength,1)),srcyv.reshape((src_fulllength,1)),srczv.reshape((src_fulllength,1))),axis=1)
+
+# for mag-field also insert the probe_distance
+rv, cv = np.meshgrid(rscale, cscale, indexing='ij')
+fulllength=np.prod(rv.shape)
+
+# make a dictionary of all the different field_pos_lists generated with different probe_distances
+field_dict = dict()
+dist_list = [5e-3,]
+for i in range(-8, 2, 1):
+  probe_dist=1.59*(10**i)
+  print(probe_dist)
+  field_pos_list=np.concatenate((cv.reshape((fulllength,1)),
+                                 rv.reshape((fulllength,1))
+                                 ),
+                                axis=1)
+  field_pos_list=np.insert(field_pos_list,0,probe_dist,axis=1)
+
+  field_dict[i] = field_pos_list
+
+print(100*'*')
+
+# so every different probe_dist generates a different field_pos_list
+
+# set up the conversion matrix between mag-suscep and mag-field---------------------------------------------------------------------------------------
+oneD=0   # to do z-only calc in this framework for magnetic susceptibility (may be more stable)
+
+# make a dict of different A tensors generated by different mag-field tensors
+A_dict = dict()
+
+for key in field_dict.keys():
+  field_pos_list = field_dict[key]
+
+  # make sure to reshape such that multiply the correct field components
+  # A matrix is not very sparse, so maybe faster to do in non-sparse setup
+  fpl=field_pos_list.shape[0]
+  A=np.zeros((2,field_pos_list.shape[0],src_pos_list.shape[0],3),dtype=float)
+  for i in range(src_pos_list.shape[0]):
+    # for every point in the source position, aka cell grid 
+      posdiff=src_pos_list[i,:]-field_pos_list
+        # this is a broadcasted operation
+        # posdiff is field_pos_list but every row is subtracted from ths ith row in suscept_pos_list
+      inv_r=1/np.sqrt(np.sum(posdiff**2,axis=1))
+        # performed for each row
+      inv_r5=inv_r**5
+      inv_r3=inv_r**3
+      
+      for fidx in range(2):
+          fidx2=fidx+1    # this is the real dim index (compatible with sidx)
+                          # since I only have y and z components of the field
+          
+          if oneD:
+              sidx=2
+              A[fidx,:,i,sidx]=3*posdiff[:,fidx2]*posdiff[:,sidx]*inv_r5
+              # A[0, :, i, 2] = 3*posdiff[:,1]*posdiff[:,2] * inv_r5
+              # A[1, :, i, 2] = 3*posdiff[:,2]*posdiff[:,2] * inv_r5
+              if sidx==fidx2:
+                  A[fidx,:,i,sidx]=A[fidx,:,i,sidx]-inv_r3
+                  #A[1, :, i, 2] = A[1, :, i, 2] - inv_r3
+          else:
+              for sidx in range(3):
+                  A[fidx,:,i,sidx]=3*posdiff[:,fidx2]*posdiff[:,sidx]*inv_r5
+                  #A[0, :, i, 0] = 3*posdiff[:, 1] * posdiff[:,0] * inv_r5
+                  #A[0, :, i, 1] = 3*posdiff[:, 1] * posdiff[:,1] * inv_r5
+                  #A[0, :, i, 2] = 3*posdiff[:, 1] * posdiff[:,2] * inv_r5
+                  #A[1, :, i, 0] = 3*posdiff[:, 2] * posdiff[:,0] * inv_r5
+                  #A[1, :, i, 1] = 3*posdiff[:, 2] * posdiff[:,1] * inv_r5
+                  #A[1, :, i, 2] = 3*posdiff[:, 2] * posdiff[:,2] * inv_r5
+                  if sidx==fidx2:
+                      A[fidx,:,i,sidx]=A[fidx,:,i,sidx]-inv_r3
+                      #A[0, :, i, 1] = A[0, :, i, 1] - inv_r3
+                      #A[1, :, i, 2] = A[1, :, i, 2] - inv_r3
+      
+  A_dict[key]=A.reshape((fpl*2,src_pos_list.shape[0]*3))
+# every different probe_dist generates a different field_pos_list which in turn generates a different A tensor
+
+# make sure we have generated corresponding tensors
+assert A_dict.keys() == field_dict.keys()
+# test to see if the generated tensors are actually different
+assert np.any(A_dict[0] != A_dict[-2])
+
+# proper conversion units
+for key in A_dict.keys():
+  B0=20e-6
+  A_dict[key]=A_dict[key]*dV*B0/4/np.pi
+
+# generate psudo battery data sets -------------------------------------------------------------------------------------------------------------------
+
+# number of samples to be generated in the set
+num_sim2=10000
+
+# function to forwardly calculate mag-field from synthetic mag-suscept
+def calcfield(suscept, A):
+  '''
+  input:
+    suscept: a 3-D array of magnetic susceptibility, must have the same shape as npts
+    A: the 'A' coefficient tensor corresponding to the suscept generated from the different mag-field position grids
+  return:
+    fieldy: 2-D matrix of the y-component of magnetic field vector space
+    fieldz: 2-D matrix of the z-component of magnetic field vector space
+  '''
+  source_vec=np.squeeze(suscept[:,:,:]).reshape((src_fulllength*3,1))
+  magfield=np.dot(A,source_vec)
+  fieldy = magfield[0:fpl,0].reshape((rv.shape[0],rv.shape[1]))
+  fieldz = magfield[fpl:2*fpl,0].reshape((rv.shape[0],rv.shape[1]))
+  return fieldy, fieldz
+
+# generate random magntic susceptibility distributions, based on a set of random gaussian peaks 
+
+# genearte 1 set of data for each different probe_dist
+# this will be a dictionary of dictionaries
+set_dict = dict()
+
+for key in A_dict.keys():
+  data_dict = dict()
+  training_labels=np.zeros((num_sim2, npts[2], npts[1],3)) 
+  training_data=np.zeros((num_sim2, rv.shape[0], rv.shape[1],2))
+  maxlevelrange=200e-6
+  numberpeaks=10;
+  idx1=range(npts[2])
+  idx2=range(npts[1])
+  midx1,midx2=np.meshgrid(idx1,idx2,indexing='ij')
+  for ii in range(num_sim2):
+    # for now just produce z susceptibility (easier for checking result?)
+    # here provide alternative training set  exp(-x^2/(2sigma^2))
+    if True:
+      for iii in range(numberpeaks):
+          pos1=np.random.rand(1)*npts[2]
+          pos2=np.random.rand(1)*npts[1]
+          w1=np.random.rand(1)*npts[2]/5+1
+          w2=np.random.rand(1)*npts[1]/5+1
+          amp=np.random.rand(1)*maxlevelrange
+          training_labels[ii, :, :,2]=training_labels[ii, :, :,2]+amp*np.exp(-((midx1-pos1)/w1)**2-((midx2-pos2)/w2)**2)
+    else:
+      # for network best to create the susceptibility in the transposed version
+      #training_labels[ii, :, :,2] = maxlevelrange*np.random.rand(npts[1], npts[2])
+      training_labels[ii, :, :,2] = maxlevelrange*np.random.rand(npts[2], npts[1])  # only z susceptibility for now 
+        
+    training_data[ii, :, :,0],training_data[ii, :, :,1] = calcfield(training_labels[ii,:,:,:], A_dict[key])
+    # so the input data will be the mag-field, chanel 0 will be y-component, chanel 1 will be z-component
+    # the output, or what we are trying to predict, are the mag susceptibilities
+
+  # train, validation, and test split-------------------------------------------------------------------------------------------------------------
+
+  # a list of random indices thats 40% of the samples
+  val_test_idx = random.sample(range(num_sim2), int(0.4*num_sim2))
+  # get the remainder of the indices as train
+  train_idx = np.setdiff1d(range(num_sim2),val_test_idx)
+
+  val_data = training_data[val_test_idx[:int(0.4*num_sim2/2)], :, :, :]
+  val_labels = training_labels[val_test_idx[:int(0.4*num_sim2/2)], :, :, :]
+
+  test_data = training_data[val_test_idx[int(0.4*num_sim2/2):], :, :, :]
+  test_labels = training_labels[val_test_idx[int(0.4*num_sim2/2):], :, :, :]
+
+  train_data = training_data[train_idx, :, :, :]
+  train_labels = training_labels[train_idx, :, :, :]
+
+  # TF requires this kind of transformation into tensor
+  train_images_t2b=tf.constant(train_data)
+  train_labels_t2b=tf.constant(train_labels)
+
+  val_images_t2b=tf.constant(val_data)
+  val_labels_t2b=tf.constant(val_labels)
+
+  test_images_t2b=tf.constant(test_data)
+  test_labels_t2b=tf.constant(test_labels)
+
+  data_dict['train_images_t2b'] = train_images_t2b
+  data_dict['train_labels_t2b'] = train_labels_t2b
+  data_dict['val_images_t2b'] = val_images_t2b
+  data_dict['val_labels_t2b'] = val_labels_t2b
+  data_dict['test_images_t2b'] = test_images_t2b
+  data_dict['test_labels_t2b'] = test_labels_t2b
+
+  # put this dictionary of datasets into the dictionary of different probe_dist
+  set_dict[key] = data_dict
+
+# make sure we have actually generated different data based on differet probe_dist
+assert np.any(set_dict[-2]['train_images_t2b'] != set_dict[0]['train_images_t2b'])
+
+def imshow_center(data):
+  '''
+  Display data as an image; i.e. on a 2D regular raster.
+  input:
+    data: a single battery's 
+      magnetic field image that is an array with shape [64,32] with scalar data,
+      or magnetic susceptibility image that is an array with shape [32,16]
+  output:
+    figure
+  '''
+  maxval=np.max(np.abs(data))
+  plt.imshow(data, cmap="seismic",vmin=-maxval,vmax=maxval)
+  plt.colorbar()
+
+imshow_center(set_dict[-4]['train_images_t2b'][33,:,:,0])
+plt.savefig('-4_training_sample_33.png')
+
+# for historical reasons, the magnetic susceptibility map shows up transpose, 
+# I guess it would be good to change that at some point, but for now keeping it 
+imshow_center(np.transpose(set_dict[-4]['train_labels_t2b'][33,:,:,2]))
+plt.savefig('-4_training_label_33.png')
+
+imshow_center(set_dict[-2]['train_images_t2b'][33,:,:,0])
+plt.savefig('-2_training_sample_33.png')
+
+# for historical reasons, the magnetic susceptibility map shows up transpose, 
+# I guess it would be good to change that at some point, but for now keeping it 
+imshow_center(np.transpose(set_dict[-2]['train_labels_t2b'][33,:,:,2]))
+plt.savefig('-2_training_label_33.png')
+
+imshow_center(set_dict[0]['train_images_t2b'][33,:,:,0])
+plt.savefig('0_training_sample_33.png')
+
+# for historical reasons, the magnetic susceptibility map shows up transpose, 
+# I guess it would be good to change that at some point, but for now keeping it 
+imshow_center(np.transpose(set_dict[0]['train_labels_t2b'][33,:,:,2]))
+plt.savefig('0_training_label_33.png')
+
+# model setup ----------------------------------------------------------------------------------------------------------------------------------------
+
+def get_figure():
+    """
+    Returns:
+      an emtpy figure and an empty axis objects to plot on. 
+    
+    Removes top and right border and ticks, because those are ugly
+    """
+    fig, ax = plt.subplots(1)
+    plt.tick_params(top=False, right=False, which='both') 
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    return fig, ax
+
+def conv_block_h2(input_tensor, num_filters, dropout_level = 0.15):
+    encoder = layers.Conv2D(num_filters, (3, 3), padding='same')(input_tensor)
+    encoder = layers.BatchNormalization()(encoder)
+    encoder = layers.Activation('relu')(encoder)
+    encoder = layers.Conv2D(num_filters, (3, 3), padding='same')(encoder)
+    encoder = layers.BatchNormalization()(encoder)
+    encoder = layers.Dropout(dropout_level)(encoder)
+    encoder = layers.Activation('relu')(encoder)
+    return encoder
+
+def encoder_block_h2(input_tensor, num_filters, dropout_level = 0.15):
+    encoder = layers.BatchNormalization()(input_tensor) # added a first normalization layer
+    encoder = conv_block_h2(input_tensor, num_filters)
+    encoder_pool = layers.MaxPooling2D((2, 2), strides=(2, 2))(encoder)
+    return encoder_pool, encoder
+
+def decoder_block_h2(input_tensor, concat_tensor, num_filters, dropout_level = 0.15):
+    decoder = layers.Conv2DTranspose(num_filters, (2, 2), strides=(2, 2), padding='same')(input_tensor)
+    decoder = layers.concatenate([concat_tensor, decoder], axis=-1)
+    decoder = layers.Conv2D(num_filters, (3, 3), padding='same')(decoder)
+    decoder = layers.BatchNormalization()(decoder)
+    decoder = layers.Dropout(dropout_level)(decoder)
+    decoder = layers.Activation('relu')(decoder)
+    decoder = layers.Conv2D(num_filters, (3, 3), padding='same')(decoder)
+    decoder = layers.BatchNormalization()(decoder)
+    decoder = layers.Activation('relu')(decoder)
+    return decoder
+
+def custom_loss_mse(y_true,y_pred):
+    loss=K.mean(K.square(y_pred-y_true),axis=None)  #+K.sum(0*K.abs(penalty)) #can adjust the penalty weight
+    return loss
+
+def custom_loss_rmse(y_true,y_pred):
+    loss=K.sqrt(K.mean(K.square(y_pred-y_true),axis=None))  #+K.sum(0*K.abs(penalty)) #can adjust the penalty weight
+    return loss
+
+def custom_loss_abs(y_true,y_pred):
+    loss=K.mean(K.abs(y_pred-y_true),axis=None)  #+K.sum(0*K.abs(penalty)) #can adjust the penalty weight
+    return loss
+
+# grid search over model ------------------------------------------------------------------------------------------------------------------------------
+
+# our model might not be able to be wrapped in a scikit_learn model
+# so we have to do the for-loops by hand
+# train and val sets are not part of the input, so they must be defined as global variables prior
+# unless, in this case, we need to fit on different train and val sets
+# so they must be configured as function arguments for us to insert different sets into the model fitting
+
+# set the default values to the best parameter values we have found so far
+
+def grid_search(train_images_t2b, train_labels_t2b, val_images_t2b, val_labels_t2b, dist,
+                dropout_level_lst=[0.05], beta2_lst=[0.999], beta1_lst=[0.9], lr_rate_lst = [0.001],
+                epsilon_lst=[1e-08], epo_lst = [3000], bat_size_lst = [128]
+                ):
+  # initialize values
+  val_loss = np.inf
+  best_params = dict()
+  dist=dist
+
+  for dp_level in dropout_level_lst:
+    inputs_h2 = layers.Input(shape=(64,32,2))
+    # same as (rscale, cscale, 2)
+    # also same as the dimension for EACH image in the training set
+    encoder0_pool_h2, encoder0_h2 = encoder_block_h2(inputs_h2, 8, dropout_level=dp_level)
+    encoder1_pool_h2, encoder1_h2 = encoder_block_h2(encoder0_pool_h2, 16, dropout_level=dp_level)
+    encoder2_pool_h2, encoder2_h2 = encoder_block_h2(encoder1_pool_h2, 32, dropout_level=dp_level)
+    encoder3_pool_h2, encoder3_h2 = encoder_block_h2(encoder2_pool_h2, 64, dropout_level=dp_level)
+    center_h2 = conv_block_h2(encoder3_pool_h2, 128, dropout_level=dp_level)
+    decoder3_h2 = decoder_block_h2(center_h2, encoder3_h2, 64, dropout_level=dp_level)
+    decoder2_h2 = decoder_block_h2(decoder3_h2, encoder2_h2, 32, dropout_level=dp_level)
+    decoder1_h2 = decoder_block_h2(decoder2_h2, encoder1_h2, 16, dropout_level=dp_level)
+    outputs_h2 = layers.Conv2D(3, (1, 1), padding="same")(decoder1_h2)   # simply set number of output channels here, seems legit
+
+    model_ht2b = models.Model(inputs=[inputs_h2], outputs=[outputs_h2])
+
+    for beta2 in beta2_lst:
+      for beta1 in beta1_lst:
+        for lr_rate in lr_rate_lst:
+          for eps in epsilon_lst:
+            adam=keras.optimizers.Adam(learning_rate = lr_rate, beta_1 = beta1, beta_2=beta2, epsilon = eps)
+
+            model_ht2b.compile(optimizer=adam,
+                               loss=custom_loss_rmse) # let's use rmse for optimization becuase it is a bigger target than mse
+
+            # construct checkpoint for saving the best model for current training
+            curr_best_filepath=str(dist)+"/current.best.h5"
+            checkpoint = ModelCheckpoint(curr_best_filepath, 
+                                        monitor='val_loss', # this must be the same string as a metric from your model training verbose output
+                                        verbose=1, 
+                                        save_best_only=True, # only save the model if it out-performs all previous ones
+                                        mode='min', # we want minimum loss
+                                        save_weights_only=False # we want to save the entire model, not just the weights
+                                        )
+            callbacks_list = [checkpoint]
+
+            for epo in epo_lst:
+              for bat_size in bat_size_lst:
+                start = time.time()
+                history_ht2b = model_ht2b.fit(train_images_t2b, 
+                                              train_labels_t2b,
+                                              validation_data = (val_images_t2b, val_labels_t2b),  
+                                              epochs=epo, 
+                                              batch_size=bat_size, 
+                                              shuffle=True,
+                                              callbacks = callbacks_list,
+                                              verbose=1)
+                training_time = time.time()-start
+                
+                # load best model from current training b/c the best model might not be the last model
+                model_ht2b = tf.keras.models.load_model(curr_best_filepath, 
+                                                        custom_objects={'custom_loss_rmse': custom_loss_rmse})
+                new_loss = custom_loss_rmse(val_labels_t2b, model_ht2b.predict(val_images_t2b))
+                
+                if new_loss.numpy() < val_loss:
+                  print()
+                  print('final validation loss decreased from ', val_loss, ' to ', new_loss.numpy())
+                  print('saving the current best model as the overall best model')
+                  print(100*'*')
+                  val_loss = new_loss.numpy()
+                  
+                  best_params['best_dropout_rate'] = dp_level
+                  best_params['best_beta_2'] = beta2
+                  best_params['best_beta_1'] = beta1
+                  best_params['best_learning_rate'] = lr_rate
+                  best_params['best_epsilon'] = eps
+                  best_params['best_epochs'] = epo
+                  best_params['best_batch_size'] = bat_size
+
+                  best_params['best_val_loss_reached'] = val_loss
+                  best_params['training_time'] = training_time
+                  best_params['val_loss_his'] = history_ht2b.history['val_loss']
+                  best_params['train_loss_his'] = history_ht2b.history['loss']
+                    # comment these out for now because they take way too much space when printed out 
+                  
+                  # save the best overall grid-searched model found so far 
+                  best_filepath = str(dist)+'/model.best.h5'
+                  model_ht2b.save(best_filepath)
+                  
+                  # save history of validation-loss from the best model to observe epochs effect
+                  with open(str(dist)+'/best_val_loss_history.db', 'wb') as file_pi:
+                    pk.dump(history_ht2b.history['val_loss'], file_pi)
+                  # later open with 
+                  # val_loss_history_ht2b = pk.load(open('best_val_loss_history.db', "rb"))
+
+                  # save history of training-loss from the best model to observe epochs effect
+                  with open(str(dist)+'/best_train_loss_history.db', 'wb') as file_pi:
+                    pk.dump(history_ht2b.history['loss'], file_pi)
+                  # later open with 
+                  # train_loss_history_ht2b = pk.load(open('best_train_loss_history.db', "rb"))
+
+                  # save the best_params dictionary along the way incase training gets killed mid-way and the function doesn't get to finish
+                  # "w" mode automatically overwrites if the file already exists
+                  param_json = json.dumps(best_params)
+                  f = open(str(dist)+'/best_params.json',"w")
+                  f.write(param_json)
+                  f.close()
+
+                  # save a plot of the val_loss_history for the best performing model for observation
+                  fig, ax = get_figure()
+                  fig.set_size_inches(20,10)
+                  num_epochs=len(history_ht2b.history['val_loss'])
+                  startpoints=0
+                  ax.set_yscale('log') # set y-axis to log_10 scale for better viewing
+                  ax.plot((np.arange(num_epochs*1)+1)[startpoints:], 
+                          history_ht2b.history['loss'][startpoints:], 
+                          linewidth=1, color="orange", 
+                          label="training_loss")
+                  ax.plot((np.arange(num_epochs*1)+1)[startpoints:], 
+                          history_ht2b.history['val_loss'][startpoints:], 
+                          linewidth=1, color="blue", 
+                          label="validation loss")
+                  ax.set_xlabel('epochs')
+                  ax.set_ylabel('log loss')
+                  ax.legend(frameon=False);
+                  fig.savefig(str(dist)+'/best_model_loss_history.png')
+                else:
+                  print('final validation loss did not decrease for this set of parameters')
+                  print('current overall best model and parameters does not get updated')
+                  print(100*'*')
+  return best_params
+
+result_dict = dict()
+
+for key in set_dict.keys():
+  dist=key
+  specs_dict = dict()
+  
+  try:
+    os.mkdir(str(key)) # make a directory before we can put things under it
+  except:
+    print("directory already exists")
+
+  best_params = grid_search(set_dict[key]['train_images_t2b'], set_dict[key]['train_labels_t2b'],
+                            set_dict[key]['val_images_t2b'], set_dict[key]['val_labels_t2b'], dist=key)
+  specs_dict['best_val_loss_reached'] = best_params['best_val_loss_reached']
+  specs_dict['training_time'] = best_params['training_time']
+  specs_dict['val_loss_his'] = best_params['val_loss_his']
+  specs_dict['train_loss_his'] = best_params['train_loss_his']
+
+  # predict w the best model, or in this case, only 1 model, on the test set
+  model_ht2b=tf.keras.models.load_model(str(dist)+'/model.best.h5',
+                                        custom_objects={'custom_loss_rmse': custom_loss_rmse})
+  susax=2
+  test_images_t2b = set_dict[key]['test_images_t2b']
+  test_labels_t2b = set_dict[key]['test_labels_t2b']
+  X_test = test_images_t2b
+  y_pred_ht2 = model_ht2b.predict(test_images_t2b)
+
+  plt.figure()
+  imshow_center(y_pred_ht2[20,:,:,susax])
+  plt.title("predicted susceptibility for the 20th battery in test set with distance 1.59e"+str(key))
+  plt.savefig(str(dist)+"/test_20_pred.png")
+
+  plt.figure()
+  imshow_center(test_labels_t2b[20,:,:,susax])
+  plt.title("actual susceptibility for the 20th battery in test set with distance 1.59e"+str(key))
+  plt.savefig(str(dist)+"/test_20_true.png")
+
+  plt.figure()
+  imshow_center(y_pred_ht2[20,:,:,susax]-test_labels_t2b[20,:,:,susax])
+  # plot the the predicted susceptibility - actual susceptibility in the same chanel which is '2' for the 20th battery in test set
+  # we want this difference to be as small as possible, not too extreme in either way
+  plt.title("difference between predicted and true susceptibility for the 20th battery in test set with distance 1.59e"+str(key))
+  plt.savefig(str(dist)+'/test_20_difference.png')
+
+  test_diff = test_labels_t2b - y_pred_ht2
+  test_diff = tf.keras.backend.flatten(test_diff)
+  plt.figure(figsize=(15,7))
+  plt.hist(test_diff, bins=30, density=True, label='difference');
+  mn, mx = plt.xlim()
+  plt.xlim(mn, mx)
+  kde_xs = np.linspace(mn, mx, 60)
+  kde = stats.gaussian_kde(test_diff)
+  plt.plot(kde_xs, kde.pdf(kde_xs), label="PDF")
+  plt.legend(loc="upper left")
+  plt.ylabel('Probability')
+  plt.xlabel('difference')
+  range = np.max([np.abs(np.min(test_diff)), np.abs(np.max(test_diff))])
+  plt.xlim(-range, range)
+  plt.title("Histogram of differences for the test set with distance 1.59e"+str(key));
+  plt.savefig(str(dist)+"/test_diff_hist.png")
+
+  yf,zf=calcfield(y_pred_ht2[20,:,:,:], A_dict[key])
+  # calculate the y(dimension 0) and z(dimension 1) component of the magnetic field for the 20th battery
+  # from the predicted susceptibility output
+  # so we are kind of like recreating the input to see if it is the same as the actual input
+  # to see if the model learned the dipole forward kernel well
+
+  plt.figure()
+  imshow_center(np.squeeze(X_test[0,:,:,0])-yf)
+  plt.title("error between forwardly solved y-field from prediction and true input y-field for the 20th battery in test set with distance 1.59e"+str(key))
+  plt.savefig(str(dist)+"/test_20_yfield_diff.png")
+
+  plt.figure()
+  imshow_center(np.squeeze(X_test[0,:,:,1])-zf)
+  plt.title("error between forwardly solved z-field from prediction and true input y-field for the 20th battery in test set with distance 1.59e"+str(key))
+  plt.savefig(str(dist)+"/test_20_zfield_diff.png")
+
+  final_loss = custom_loss_rmse(test_labels_t2b, y_pred_ht2)
+  print('final RMSE loss on test set:', final_loss.numpy())
+  NRMSE = final_loss/K.mean(test_labels_t2b)
+  print('final normalized RMSE loss (div mean) on the test set:', NRMSE.numpy())
+  RMSE_range = final_loss /(tf.reduce_max(test_labels_t2b) - tf.reduce_min(test_labels_t2b))
+  print('final normalized RMSE loss (div range) on the test set:', RMSE_range.numpy())
+  test_arr = tf.keras.backend.flatten(test_labels_t2b).numpy()
+  IQR = stats.iqr(test_arr)
+  RMSE_IQR = final_loss/IQR
+  print('final normalized RMSE loss (div IQR) on the test set:', RMSE_IQR.numpy())
+  print('final norm of the difference tensor:', tf.norm(y_pred_ht2-test_labels_t2b).numpy())
+  Boll_NRMSE = tf.norm(y_pred_ht2-test_labels_t2b) / tf.norm(test_labels_t2b)
+  print('final Bollman normalized RMSE loss on the test set:', Boll_NRMSE.numpy())  
+
+  specs_dict['final_RMSE'] = final_loss.numpy()
+  specs_dict['NRMSE'] = NRMSE.numpy()
+  specs_dict['RMSE_range'] = RMSE_range.numpy()
+  specs_dict['RMSE_IQR'] = RMSE_IQR.numpy()
+  specs_dict['Boll_NRMSE'] = Boll_NRMSE.numpy()
+
+  result_dict[key] = specs_dict
+
+  print(100*'|')
+
+assert result_dict.keys() == set_dict.keys()
+assert len(result_dict[-8].keys()) == 9 # there should be 9 different specs for each distance 
+
+Boll_NRMSE_lst = []
+best_val_loss_lst=[]
+dict_lst = []
+for key in result_dict.keys():
+  Boll_NRMSE_lst.append(result_dict[key]['Boll_NRMSE'])
+  best_val_loss_lst.append(result_dict[key]['best_val_loss_reached'])
+  dict_lst.append(key)
+  # let's add the key here to really make sure the losses and the distances match up
+
+print(dict_lst)
+print(Boll_NRMSE_lst)
+print(100*'*')
+plt.figure(figsize=None)
+plt.plot(dict_lst, Boll_NRMSE_lst, label="test_Boll_NRMSE", linestyle='--', marker='o') 
+plt.legend()
+plt.xlabel('1.59e')
+plt.savefig('dist_vs_NRMSE.png')
+
+print(dict_lst)
+print(best_val_loss_lst)
+print(100*'*')
+plt.figure(figsize=None)
+plt.plot(dict_lst, best_val_loss_lst, label="best_val_loss", linestyle='--', marker='o') 
+plt.legend()
+plt.xlabel('1.59e')
+plt.ylabel('rmse')
+plt.savefig('dist_vs_val_loss.png')
+
+try:
+  # save the final result dictionary
+  # bc earlier versions of python does not support 'with' statement we have to do this?
+  result_json = json.dumps(result_dict)
+  f = open("result_dict.json","w")
+  f.write(result_json)
+  f.close()
+  print('saved result dictionary')
+
+  # load the json file later with
+  # f = open("result_dict.json", "r")
+  # try:
+  #     result_dict = json.load(f)
+  # finally:
+  #     f.close()
+except:
+  print('could not save result dictionary')
